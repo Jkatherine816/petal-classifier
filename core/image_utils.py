@@ -1,59 +1,89 @@
 """
-core/image_utils.py - 图像几何工具
+core/image_utils.py - 花瓣图像的公共几何处理
+
+拆分器与"快速路径"单花瓣渲染共用同一套裁剪/缩放逻辑，
+保证两条路径产生的花瓣图像几何规范完全一致。
 """
 
 import numpy as np
-from PIL import Image
+import cv2
 
 
-def crop_and_square(image_rgba, output_size, margin=10):
+def crop_and_square(image_rgba, output_size, margin=10, alpha_threshold=10):
     """
-    按非透明像素包围盒裁剪并补白为正方形，缩放到 output_size。
-    输入：RGBA numpy 数组 (H, W, 4)；输出：RGB PIL 图像。
-    """
-    alpha = image_rgba[..., 3]
-    rows = np.any(alpha > 10, axis=1)
-    cols = np.any(alpha > 10, axis=0)
-    if not rows.any() or not cols.any():
-        # 空图：返回白底
-        return Image.new('RGB', (output_size, output_size), (255, 255, 255))
-    rmin, rmax = np.where(rows)[0][[0, -1]]
-    cmin, cmax = np.where(cols)[0][[0, -1]]
-    rmin = max(0, rmin - margin)
-    cmin = max(0, cmin - margin)
-    rmax = min(image_rgba.shape[0] - 1, rmax + margin)
-    cmax = min(image_rgba.shape[1] - 1, cmax + margin)
+    将 RGBA 图像按 alpha 通道裁剪出有效区域，等比缩放后居中放入正方形画布。
 
-    cropped = image_rgba[rmin:rmax + 1, cmin:cmax + 1, :3]
+    参数：
+        image_rgba: (H, W, 4) uint8 图像
+        output_size: 输出正方形边长
+        margin: 裁剪边距（像素）
+        alpha_threshold: 判定"有内容"的 alpha 阈值
+    返回：
+        (output_image, ok): (output_size, output_size, 4) 图像；无有效内容时 ok=False
+    """
+    if image_rgba is None:
+        return None, False
+
+    alpha = image_rgba[:, :, 3]
+    non_zero = np.where(alpha > alpha_threshold)
+    if len(non_zero[0]) == 0:
+        return None, False
+
+    h_img, w_img = image_rgba.shape[:2]
+    y_min, y_max = np.min(non_zero[0]), np.max(non_zero[0])
+    x_min, x_max = np.min(non_zero[1]), np.max(non_zero[1])
+
+    y_min = max(0, y_min - margin)
+    y_max = min(h_img, y_max + margin)
+    x_min = max(0, x_min - margin)
+    x_max = min(w_img, x_max + margin)
+
+    cropped = image_rgba[y_min:y_max, x_min:x_max]
     h, w = cropped.shape[:2]
-    side = max(h, w)
-    canvas = np.full((side, side, 3), 255, dtype=np.uint8)
-    y0 = (side - h) // 2
-    x0 = (side - w) // 2
-    canvas[y0:y0 + h, x0:x0 + w] = cropped
-    img = Image.fromarray(canvas)
-    return img.resize((output_size, output_size), Image.LANCZOS)
+    if h <= 0 or w <= 0:
+        return None, False
+
+    scale = min(output_size / h, output_size / w)
+    new_h, new_w = max(1, int(h * scale)), max(1, int(w * scale))
+    if scale != 1.0:
+        resized = cv2.resize(cropped, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    else:
+        resized = cropped
+
+    output = np.zeros((output_size, output_size, 4), dtype=np.uint8)
+    y_off = (output_size - new_h) // 2
+    x_off = (output_size - new_w) // 2
+    output[y_off:y_off + new_h, x_off:x_off + new_w] = resized
+    return output, True
 
 
-def rgba_to_rgb(fig_array):
-    """matplotlib buffer_rgba 的 (H,W,4) -> (H,W,3) 白底合成"""
-    rgb = fig_array[..., :3].astype(np.float32)
-    alpha = fig_array[..., 3:4].astype(np.float32) / 255.0
-    return (rgb * alpha + 255 * (1 - alpha)).astype(np.uint8)
+def rgba_to_rgb(image_rgba, background=(0, 0, 0)):
+    """RGBA -> RGB，透明区域以指定底色填充（默认黑底）。"""
+    if image_rgba.shape[2] == 3:
+        return image_rgba
+    rgb = cv2.cvtColor(image_rgba, cv2.COLOR_RGBA2RGB)
+    alpha = image_rgba[:, :, 3:4].astype(np.float32) / 255.0
+    bg = np.zeros_like(rgb)
+    bg[:, :] = background
+    out = (rgb.astype(np.float32) * alpha + bg.astype(np.float32) * (1 - alpha))
+    return out.astype(np.uint8)
 
 
-def to_gray_rgb(img_array):
-    """RGB -> 灰度 -> 三通道（保持模型输入通道数一致）"""
-    gray = np.dot(img_array[..., :3], [0.299, 0.587, 0.114]).astype(np.uint8)
-    return np.stack([gray] * 3, axis=-1)
+def to_gray_rgb(image_rgb):
+    """RGB -> 灰度后再复制成 3 通道，彻底去除颜色信息（防颜色捷径的保险）。"""
+    gray = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2GRAY)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
 
 
-def petal_centroid_direction(mask):
-    """掩膜质心方向（度，数学角度约定：东 0° 逆时针），用于自检"""
-    ys, xs = np.nonzero(mask)
+def petal_centroid_direction(image_rgba, alpha_threshold=10):
+    """
+    返回花瓣像素质心相对图像中心的方向向量 (dx, dy)，
+    其中 dy 为数学方向（向上为正）。用于验证摆正效果。
+    """
+    alpha = image_rgba[:, :, 3]
+    ys, xs = np.where(alpha > alpha_threshold)
     if len(xs) == 0:
         return None
-    cy, cx = mask.shape[0] / 2, mask.shape[1] / 2
-    dy = ys.mean() - cy
-    dx = xs.mean() - cx
-    return float(np.degrees(np.arctan2(-dy, dx)) % 360.0)
+    h, w = alpha.shape
+    cx, cy = w / 2.0, h / 2.0
+    return float(xs.mean() - cx), float(cy - ys.mean())
