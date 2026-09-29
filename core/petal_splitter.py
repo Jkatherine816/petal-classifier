@@ -1,179 +1,236 @@
 """
-core/petal_splitter.py - 六合一图像拆分器
+core/petal_splitter.py - 花瓣拆分器（镜像问题已修复）
 
-把 224×224 六合一 SDP 图像拆成 6 个 64×64 单花瓣，旋转对齐到统一方向，
-并按标签目录落盘（训练数据组织）。
+修复要点（相对旧版 petal_splitter.py / petal_splitter_fixed.py）：
+    旧版用 arctan2(dy, dx) 测量像素角度，忽略了图像 y 轴向下，
+    导致 pos i 实际抓到 pos 5-i 的花瓣（镜像错位）；
+    "fixed" 版把角度测量反过来、同时又把扇形列表反转，两者抵消，修复无效。
+    本版：角度测量改为 arctan2(-dy, dx)，扇形列表保持 constants 中的定义不动。
 
-【核心修复 - 扇形镜像 bug】
-旧版两个拆分器在提取位置 i 时实际取到的是位置 5-i 的内容
-（极坐标数学角度 vs 图像像素 y 轴向下导致的镜像）。
-本版像素角度恢复严格使用：
-    angles = degrees(arctan2(-dy, dx)) % 360
-扇形表 SECTOR_ANGLES 保持 [(0,60),...,(300,360)] 不反转。
-已加入像素级回归测试（tests/test_pipeline.py::TestSplitLabelConsistency）。
-
-旋转对齐：把扇形中心方向转到正上方（90°）：
-    rotation_angle = 90 - SECTOR_CENTERS[idx]
-cv2.getRotationMatrix2D 的正角度 = 数学正方向（逆时针）旋转。
+    回归验证见 tests/test_pipeline.py（颜色自校验 + 摆正方向校验）。
 """
 
 import os
 import json
+import glob
 import logging
 
-import cv2
 import numpy as np
+import cv2
 from PIL import Image
 
-from .constants import (CLASSES, SECTOR_ANGLES, SECTOR_CENTERS,
-                        CLASS_DIR_PREFIX, METADATA_SUFFIX,
-                        POSITION_TO_TYPE, DEFAULT_INPUT_SIZE)
-from .image_utils import crop_and_square, to_gray_rgb
+from .constants import (
+    CLASSES, CLASS_DIR_PREFIX, METADATA_SUFFIX,
+    SECTOR_ANGLES, SECTOR_CENTERS, POSITION_TO_TYPE,
+    DEFAULT_PETAL_SIZE,
+)
+from .image_utils import crop_and_square, rgba_to_rgb, to_gray_rgb
 
 logger = logging.getLogger(__name__)
 
+# 判定扇形"有数据"的最少非透明像素数
+MIN_PIXELS = 50
+
 
 class PetalSplitter:
-    def __init__(self, output_size=DEFAULT_INPUT_SIZE, debug=False):
+    """六合一图像 -> 6 个摆正的单花瓣图像"""
+
+    def __init__(self, output_size=DEFAULT_PETAL_SIZE, debug=False):
         self.output_size = output_size
         self.debug = debug
 
     # ------------------------------------------------------------ 几何
-    def sector_mask(self, shape, center, radius, angle_lo, angle_hi):
-        """生成扇形掩膜（角度为数学约定：东 0° 逆时针；图像 y 轴向下需取负）"""
-        h, w = shape[:2]
-        yy, xx = np.mgrid[0:h, 0:w]
-        dx = xx - center[0]
-        dy = yy - center[1]
-        r = np.hypot(dx, dy)
-        angles = np.degrees(np.arctan2(-dy, dx))   # 关键：-dy
+    @staticmethod
+    def sector_mask(image_shape, sector_idx):
+        """
+        生成扇形掩码。角度按数学坐标测量：angle = degrees(arctan2(-dy, dx)) % 360。
+        """
+        height, width = image_shape[:2]
+        cx, cy = width // 2, height // 2
+
+        y_coords, x_coords = np.ogrid[:height, :width]
+        dx = x_coords - cx
+        dy = y_coords - cy
+
+        angles = np.degrees(np.arctan2(-dy, dx))   # 关键修复：-dy
         angles = np.mod(angles, 360.0)
-        mask = (r <= radius) & (r > 3) & (angles >= angle_lo) & (angles < angle_hi)
-        return mask
 
-    def find_center_radius(self, gray):
-        """圆心=暗色中心点，半径=前景最大距离"""
-        h, w = gray.shape
-        fg = gray < 240
-        ys, xs = np.nonzero(fg)
-        if len(xs) == 0:
-            return (w / 2, h / 2), min(h, w) * 0.42
-        # 圆心取图像几何中心附近最暗的点（中心锚点黑点）
-        cy, cx = h / 2, w / 2
-        d = np.hypot(xs - cx, ys - cy)
-        inner = fg & (d < min(h, w) * 0.05)
-        if inner.any():
-            iy, ix = np.nonzero(inner)
-            cx, cy = ix.mean(), iy.mean()
-        radius = np.percentile(np.hypot(xs - cx, ys - cy), 99.5)
-        return (cx, cy), radius
+        start, end = SECTOR_ANGLES[sector_idx]
+        if start < end:
+            angle_mask = (angles >= start) & (angles <= end)
+        else:  # 跨 0°（本定义下不会发生，保留防御）
+            angle_mask = (angles >= start) | (angles <= end)
 
-    def extract_and_align(self, img, mask, center, idx):
-        """抠出扇形 idx 并旋转到统一方向（中心朝正上方）"""
-        out = img.copy()
-        out[~mask] = 255
-        rotation_angle = 90.0 - SECTOR_CENTERS[idx]
-        h, w = out.shape[:2]
-        M = cv2.getRotationMatrix2D(center, rotation_angle, 1.0)
-        rotated = cv2.warpAffine(out, M, (w, h), borderValue=(255, 255, 255))
-        return rotated
+        distances = np.sqrt(dx ** 2 + dy ** 2)
+        circle_mask = distances <= min(width, height) // 2
+        return angle_mask & circle_mask
+
+    def extract_and_align(self, image_rgba, sector_idx):
+        """
+        提取扇形区域并摆正（扇形中心线旋转到正上方），再裁剪缩放为正方形。
+
+        返回：(petal_rgba, has_data)
+        """
+        if image_rgba is None:
+            return None, False
+
+        height, width = image_rgba.shape[:2]
+        mask = self.sector_mask((height, width), sector_idx)
+
+        sector_image = np.zeros((height, width, 4), dtype=np.uint8)
+        for c in range(4):
+            sector_image[:, :, c] = image_rgba[:, :, c] * mask.astype(np.uint8)
+
+        alpha = sector_image[:, :, 3]
+        if int(np.sum(alpha > 10)) <= MIN_PIXELS:
+            return None, False
+
+        # 摆正：cv2 正角度 = 数学正方向旋转，把扇形中心转到 90°（正上方）
+        rotation_angle = 90.0 - SECTOR_CENTERS[sector_idx]
+        rot_mat = cv2.getRotationMatrix2D((width // 2, height // 2),
+                                          rotation_angle, 1.0)
+        rotated = cv2.warpAffine(
+            sector_image, rot_mat, (width, height),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0, 0))
+
+        return crop_and_square(rotated, self.output_size)
 
     # ------------------------------------------------------------ 标签
-    def get_label(self, idx, image_name, metadata=None):
+    @staticmethod
+    def load_metadata(metadata_path):
+        if not metadata_path or not os.path.exists(metadata_path):
+            return None
+        try:
+            with open(metadata_path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as exc:
+            logger.warning('加载元数据失败 %s: %s', metadata_path, exc)
+            return None
+
+    @staticmethod
+    def get_label(sector_idx, metadata):
         """
-        优先级：metadata 的 true_label > 文件名规则（模式A）> None（模式B未知）
+        确定花瓣标签：
+            模式A：优先元数据 true_label；缺失时按 image_type 回退
+                   （all_normal -> normal；fixed_anomalies -> 位置映射）。
+            模式B / 无元数据：返回 None（未知，供预测流程）。
         """
-        if metadata:
-            petals = metadata.get('petals') or []
-            if idx < len(petals) and petals[idx]:
-                tl = petals[idx].get('true_label')
-                if tl in CLASSES:
-                    return tl
-        if 'all_normal' in image_name or 'train_normal' in image_name:
-            return 'normal'
-        if 'fixed_anomal' in image_name or 'train_fixed' in image_name:
-            return POSITION_TO_TYPE.get(idx)
+        if not metadata:
+            return None
+
+        petals = metadata.get('petals') or []
+        if sector_idx < len(petals):
+            info = petals[sector_idx] or {}
+            true_label = info.get('true_label')
+            if true_label and str(true_label).lower() not in ('none', 'null'):
+                return true_label
+            if info.get('has_data') is False:
+                return None
+
+        if metadata.get('generation_mode') == 'A':
+            image_type = metadata.get('image_type')
+            if image_type == 'all_normal':
+                return 'normal'
+            if image_type == 'fixed_anomalies':
+                return POSITION_TO_TYPE.get(sector_idx)
         return None
 
-    # ------------------------------------------------------------ 主流程
+    # ------------------------------------------------------------ 拆分
     def split(self, image_path, metadata_path=None, output_dir=None,
               strip_color=False):
         """
-        拆分一张六合一图，返回 6 个 dict：
-        {position, has_data, petal_image(RGB np), label, saved_path}
+        拆分一张六合一图像。
+
+        参数：
+            image_path: 六合一图像路径
+            metadata_path: 元数据路径（自动探测 <同名>_metadata.json）
+            output_dir: 若提供，有标签的花瓣按 class_<标签>/ 落盘（RGB PNG）
+            strip_color: True 时把花瓣转灰度再复制 3 通道（防颜色捷径的保险）
+        返回：
+            petals: 6 项列表 [{position, has_data, petal_image, label, saved_path}]
         """
-        img = np.array(Image.open(image_path).convert('RGB'))
-        if strip_color:
-            img = to_gray_rgb(img)
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
-        center, radius = self.find_center_radius(gray)
+        try:
+            image = np.array(Image.open(image_path).convert('RGBA'))
+        except Exception as exc:
+            logger.error('加载图像失败 %s: %s', image_path, exc)
+            return []
 
-        metadata = None
-        if metadata_path and os.path.exists(metadata_path):
-            with open(metadata_path, encoding='utf-8') as f:
-                metadata = json.load(f)
+        if metadata_path is None:
+            candidate = image_path.replace('.png', METADATA_SUFFIX)
+            metadata_path = candidate if os.path.exists(candidate) else None
+        metadata = self.load_metadata(metadata_path)
 
-        base = os.path.splitext(os.path.basename(image_path))[0]
-        results = []
-        for idx, (lo, hi) in enumerate(SECTOR_ANGLES):
-            mask = self.sector_mask(gray.shape, center, radius, lo, hi)
-            has_data = bool((gray[mask] < 240).sum() > 50)
-            aligned = self.extract_and_align(img, mask, center, idx)
-            petal = crop_and_square(
-                np.dstack([aligned, np.full(aligned.shape[:2], 255,
-                                            dtype=np.uint8)]),
-                self.output_size)
-            label = self.get_label(idx, base, metadata)
-            saved = None
-            if output_dir and label:
-                cls_dir = os.path.join(output_dir, f'{CLASS_DIR_PREFIX}{label}')
-                os.makedirs(cls_dir, exist_ok=True)
-                saved = os.path.join(cls_dir, f'{base}_pos{idx}_{label}.png')
-                petal.save(saved)
-            results.append({
-                'position': idx,
-                'has_data': has_data,
-                'petal_image': np.array(petal),
-                'label': label,
-                'saved_path': saved,
-            })
-        return results
+        if output_dir:
+            for cls in CLASSES:
+                os.makedirs(os.path.join(output_dir, f'{CLASS_DIR_PREFIX}{cls}'),
+                            exist_ok=True)
+
+        base_name = os.path.splitext(os.path.basename(image_path))[0]
+        petals = []
+        for sector_idx in range(6):
+            petal_img, has_data = self.extract_and_align(image, sector_idx)
+            entry = {'position': sector_idx, 'has_data': has_data,
+                     'petal_image': None, 'label': None, 'saved_path': None}
+            if has_data:
+                label = self.get_label(sector_idx, metadata)
+                entry['label'] = label
+                entry['petal_image'] = petal_img
+
+                if output_dir and label in CLASSES:
+                    rgb = rgba_to_rgb(petal_img)
+                    if strip_color:
+                        rgb = to_gray_rgb(rgb)
+                    class_dir = os.path.join(output_dir, f'{CLASS_DIR_PREFIX}{label}')
+                    filename = f'{base_name}_pos{sector_idx}_{label}.png'
+                    save_path = os.path.join(class_dir, filename)
+                    Image.fromarray(rgb, 'RGB').save(save_path)
+                    entry['saved_path'] = save_path
+
+                if self.debug:
+                    logger.debug('扇形 %d -> 标签 %s', sector_idx, label)
+            petals.append(entry)
+
+        valid = sum(1 for p in petals if p['has_data'])
+        logger.info('拆分 %s：%d 个有效花瓣', os.path.basename(image_path), valid)
+        return petals
 
     def batch_split(self, input_dir, output_dir, strip_color=False,
                     progress_cb=None):
-        """批量拆分目录下所有六合一图，写 split_stats.json"""
+        """
+        批量拆分目录下所有六合一图像（自动配对元数据）。
+
+        返回：{类别: 样本数}（仅统计成功落盘的有标签花瓣）
+        """
         os.makedirs(output_dir, exist_ok=True)
-        names = [fn for fn in sorted(os.listdir(input_dir))
-                 if fn.lower().endswith('.png')]
-        stats = {'total_images': 0, 'total_petals': 0, 'labeled': 0,
-                 'unlabeled': 0, 'per_class': {c: 0 for c in CLASSES}}
-        for i, fn in enumerate(names):
-            img_path = os.path.join(input_dir, fn)
-            meta_path = self.find_metadata_for(img_path)
-            results = self.split(img_path, meta_path, output_dir,
-                                 strip_color=strip_color)
-            stats['total_images'] += 1
-            for r in results:
-                if not r['has_data']:
-                    continue
-                stats['total_petals'] += 1
-                if r['label']:
-                    stats['labeled'] += 1
-                    stats['per_class'][r['label']] += 1
-                else:
-                    stats['unlabeled'] += 1
+        image_files = sorted(glob.glob(os.path.join(input_dir, '*.png')))
+        if not image_files:
+            logger.warning('批量拆分：%s 中没有 PNG 图像', input_dir)
+            return {}
+
+        stats = {}
+        for i, image_file in enumerate(image_files):
+            petals = self.split(image_file, output_dir=output_dir,
+                                strip_color=strip_color)
+            for p in petals:
+                if p['has_data'] and p['label'] in CLASSES and p['saved_path']:
+                    stats[p['label']] = stats.get(p['label'], 0) + 1
             if progress_cb:
-                progress_cb(int((i + 1) / len(names) * 100),
-                            f'{i + 1}/{len(names)} {fn}')
-        with open(os.path.join(output_dir, 'split_stats.json'), 'w',
-                  encoding='utf-8') as f:
-            json.dump(stats, f, ensure_ascii=False, indent=2)
-        logger.info('拆分完成: %s', stats)
+                progress_cb(int((i + 1) / len(image_files) * 100),
+                            f'已拆分 {i + 1}/{len(image_files)}：'
+                            f'{os.path.basename(image_file)}')
+
+        stats_path = os.path.join(output_dir, 'split_stats.json')
+        with open(stats_path, 'w', encoding='utf-8') as f:
+            json.dump(stats, f, indent=2, ensure_ascii=False)
+        logger.info('批量拆分完成：%s -> %s', stats, output_dir)
         return stats
 
-    @staticmethod
-    def find_metadata_for(image_path):
-        """六合一图对应的元数据文件路径（可能不存在）"""
-        base = os.path.splitext(image_path)[0]
-        cand = base + METADATA_SUFFIX
-        return cand if os.path.exists(cand) else None
+
+def find_metadata_for(image_path):
+    """按命名约定查找六合一图像对应的元数据文件。"""
+    base = os.path.splitext(image_path)[0]
+    for candidate in (base + METADATA_SUFFIX, base + '.json'):
+        if os.path.exists(candidate):
+            return candidate
+    return None
