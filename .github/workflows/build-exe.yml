@@ -27,16 +27,11 @@ jobs:
 
       - name: Run regression tests
         run: |
-          set QT_QPA_PLATFORM=offscreen
+          $env:QT_QPA_PLATFORM = 'offscreen'
           pytest tests/ -q
 
       - name: Build EXE with PyInstaller
-        run: |
-          pyinstaller --noconfirm --clean --windowed ^
-            --name "SDP_PetalClassifier" ^
-            --collect-all torch ^
-            --collect-all torchvision ^
-            main.py
+        run: pyinstaller --noconfirm --clean --windowed --name "SDP_PetalClassifier" --collect-all torch --collect-all torchvision main.py
 
       - name: Smoke check output
         run: |
@@ -44,8 +39,6 @@ jobs:
             Write-Error "EXE not found after build"
             exit 1
           }
-          Get-ChildItem "dist\SDP_PetalClassifier" | Select-Object -First 5
-        shell: pwsh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
