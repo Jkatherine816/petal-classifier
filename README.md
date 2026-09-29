@@ -40,13 +40,13 @@ python main.py
 ### 3. 命令行（无界面批量跑）
 
 ```bash
-python cli.py generate --output data/raw --count 100
-python cli.py render   --input data/raw --output data/images --num 500
+python cli.py generate --output data/raw --count 100 --length 6000 --seed 42
+python cli.py render   --input data/raw --output data/images --num 200
 python cli.py split    --input data/images --output data/petals --grayscale
-python cli.py split    --fast --input data/raw --output data/petals   # 快速路径
-python cli.py train    --data data/petals --output models/run --model enhanced --epochs 50 --amp
+python cli.py split    --input data/raw --output data/petals --fast   # 快速路径（跳过六合一）
+python cli.py train    --data data/petals --output models/run --model enhanced --epochs 50 --batch_size 32 --amp
 python cli.py evaluate --model models/run/best_model.pth --data data/petals
-python cli.py predict  --model models/run/best_model.pth --input 待测npy文件夹
+python cli.py predict  --model models/run/best_model.pth --input 待测npy文件夹 --output predictions
 ```
 
 ---
@@ -59,7 +59,6 @@ petal_classifier/
 ├── cli.py                   # 命令行入口
 ├── core/                    # 核心算法层（与界面无关）
 │   ├── constants.py         #   单一事实源：类别/扇形角/颜色/默认参数
-│   ├── mpl_setup.py         #   matplotlib 中文字体自动配置
 │   ├── signal_generator.py  #   7 类信号生成（可复现，numpy Generator）
 │   ├── sdp_renderer.py      #   SDP 极坐标渲染（模式A训练图/模式B预测图/单瓣直渲）
 │   ├── petal_splitter.py    #   六合一图拆分、扇形对齐、标签恢复
@@ -106,14 +105,21 @@ petal_classifier/
 QT_QPA_PLATFORM=offscreen python -m pytest tests/ -q    # 9 项回归
 ```
 
-## 六、打包为 Windows EXE（免部署分发）
+## 六、获取 Windows EXE（云端自动打包，免部署分发）
 
-本仓库配置了 GitHub Actions 自动打包（见 `.github/workflows/build-exe.yml`）：
-每次推送到 main 分支，云端 Windows 机器自动编译 exe，
-在 Actions 运行记录的 Artifacts 区域下载 `SDP-PetalClassifier-windows` 压缩包，
-解压后双击 `SDP_PetalClassifier.exe` 即可运行，目标机器无需安装 Python。
+本仓库已配置 GitHub Actions 工作流（`build-exe.yml`），每次推送到 main 分支
+都会在云端 Windows 机器上自动完成：回归测试 → PyInstaller 打包 → 上传产物。
+
+获取 exe 的步骤：
+
+1. 打开仓库的 **Actions** 标签页，等待最新的 `Build Windows EXE` 运行完成（约 10-15 分钟）；
+2. 点进该次运行，在页面底部 **Artifacts** 区下载 `SDP-PetalClassifier-windows`（zip）；
+3. 解压后双击其中的 `SDP_PetalClassifier.exe` 即可运行，
+   无需安装 Python 和任何依赖（绿色文件夹，整个目录可随意拷贝）。
 
 注意事项：
-- exe 版使用 CPU 推理/训练，大规模训练建议用 GPU 服务器 + cli.py；
+- exe 版使用 CPU 推理/训练，训练大模型建议仍用 GPU 服务器 + cli.py；
 - 模型文件不打进 exe，训练好的 best_model.pth 拷到目标机器后在 ⑤⑥ 页加载即可；
-- 工作区（workspace/）和会话配置（configs/）会自动建在 exe 旁边。
+- 工作区（workspace/）和会话配置（configs/）会自动建在 exe 旁边；
+- 产物保留 7 天，下载后本地永久可用；
+- 如需本地自行打包，保留旧脚本 `打包成EXE.bat`（在 Windows cmd 中运行）。
