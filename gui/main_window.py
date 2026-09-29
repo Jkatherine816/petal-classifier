@@ -23,9 +23,8 @@ from gui.pages.page_train import TrainPage
 from gui.pages.page_eval import EvalPage
 from gui.pages.page_predict import PredictPage
 
-# 打包成 exe（PyInstaller）后 __file__ 指向临时解压目录，
-# 工作区/配置必须锚定到 exe 所在目录，否则退出后数据丢失。
 if getattr(sys, 'frozen', False):
+    # PyInstaller 打包后：以 exe 所在目录为根（__file__ 会指向临时解压目录）
     PROJECT_ROOT = os.path.dirname(os.path.abspath(sys.executable))
 else:
     PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -54,107 +53,101 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('SDP 时序异常分类系统')
-        self.resize(1440, 900)
+        self.resize(1280, 860)
 
         self.ctx = AppContext()
 
-        # 左侧导航
+        # 步骤导航
         self.nav = QListWidget()
+        self.nav.setMaximumWidth(180)
         self.nav.addItems(['① 数据生成', '② 图像生成', '③ 花瓣拆分',
                            '④ 模型训练', '⑤ 模型评估', '⑥ 预测'])
-        self.nav.setMaximumWidth(160)
-        self.nav.setCurrentRow(0)
 
-        # 中央步骤页
+        # 步骤页
+        self.stack = QStackedWidget()
         self.pages = [GeneratePage(self.ctx), RenderPage(self.ctx),
                       SplitPage(self.ctx), TrainPage(self.ctx),
                       EvalPage(self.ctx), PredictPage(self.ctx)]
-        self.stack = QStackedWidget()
-        for p in self.pages:
-            self.stack.addWidget(p)
+        for page in self.pages:
+            self.stack.addWidget(page)
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
+        self.nav.setCurrentRow(0)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self.nav)
         splitter.addWidget(self.stack)
         splitter.setStretchFactor(1, 1)
+        self.setCentralWidget(splitter)
 
-        # 底部终端框（Dock，可折叠/拖动）
+        # 终端框（底部停靠）
         self.terminal = TerminalWidget()
+        self.terminal_dock = QDockWidget('终端', self)
+        self.terminal_dock.setWidget(self.terminal)
+        self.terminal_dock.setFeatures(
+            QDockWidget.DockWidgetClosable | QDockWidget.DockWidgetMovable)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.terminal_dock)
         self.terminal.install_global_hooks()
-        self.dock = QDockWidget('终端', self)
-        self.dock.setWidget(self.terminal)
-        self.dock.setFeatures(QDockWidget.DockWidgetMovable |
-                              QDockWidget.DockWidgetClosable)
-        self.addDockWidget(Qt.BottomDockWidgetArea, self.dock)
 
-        container = QSplitter(Qt.Vertical)
-        container.addWidget(splitter)
-        container.setStretchFactor(0, 1)
-        self.setCentralWidget(container)
-
-        self._build_menus()
-        self._load_session()
-
-    # ------------------------------------------------------------ 菜单
-    def _build_menus(self):
-        bar = self.menuBar()
-        m_file = bar.addMenu('文件')
-        act_root = m_file.addAction('设置导出根目录…')
+        # 菜单
+        file_menu = self.menuBar().addMenu('文件')
+        act_root = file_menu.addAction('设置导出根目录…')
         act_root.triggered.connect(self._pick_export_root)
-        act_ws = m_file.addAction('设置工作区…')
+        act_ws = file_menu.addAction('设置工作区…')
         act_ws.triggered.connect(self._pick_workspace)
-        m_file.addSeparator()
-        act_exit = m_file.addAction('退出')
-        act_exit.triggered.connect(self.close)
+        file_menu.addSeparator()
+        act_quit = file_menu.addAction('退出')
+        act_quit.triggered.connect(self.close)
 
-        m_view = bar.addMenu('视图')
-        act_term = m_view.addAction('显示/隐藏终端')
-        act_term.triggered.connect(
-            lambda: self.dock.setVisible(not self.dock.isVisible()))
+        view_menu = self.menuBar().addMenu('视图')
+        view_menu.addAction(self.terminal_dock.toggleViewAction())
 
+        self._load_session()
+        print('系统就绪。请先在"文件"菜单中设置导出根目录。')
+
+    # ------------------------------------------------------------ 菜单动作
     def _pick_export_root(self):
         path = QFileDialog.getExistingDirectory(self, '选择导出根目录')
         if path:
             self.ctx.export_manager.set_root(path)
-            print(f'导出根目录: {path}')
+            self.statusBar().showMessage(f'导出根目录: {path}')
 
     def _pick_workspace(self):
         path = QFileDialog.getExistingDirectory(self, '选择工作区')
         if path:
             self.ctx.workspace = path
-            print(f'工作区: {path}')
+            os.makedirs(path, exist_ok=True)
+            print(f'工作区已切换: {path}')
 
-    # ------------------------------------------------------------ 会话保存
-    def _save_session(self):
-        data = {
-            'export_root': self.ctx.export_manager.root,
-        }
-        for key in ('workspace', 'data_dir', 'image_dir', 'petals_dir',
-                    'model_dir', 'last_checkpoint'):
-            data[key] = getattr(self.ctx, key, '')
-        try:
-            os.makedirs(os.path.dirname(SESSION_PATH), exist_ok=True)
-            with open(SESSION_PATH, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-        except OSError:
-            pass
-
+    # ------------------------------------------------------------ 会话
     def _load_session(self):
         if not os.path.exists(SESSION_PATH):
             return
         try:
-            with open(SESSION_PATH, encoding='utf-8') as f:
-                data = json.load(f)
+            with open(SESSION_PATH, 'r', encoding='utf-8') as f:
+                session = json.load(f)
             for key in ('workspace', 'data_dir', 'image_dir', 'petals_dir',
                         'model_dir', 'last_checkpoint'):
-                if data.get(key):
-                    setattr(self.ctx, key, data[key])
-            if data.get('export_root'):
-                self.ctx.export_manager.set_root(data['export_root'])
-        except (OSError, json.JSONDecodeError):
-            pass
+                if session.get(key):
+                    setattr(self.ctx, key, session[key])
+            if session.get('export_root'):
+                self.ctx.export_manager.set_root(session['export_root'])
+        except Exception as exc:
+            print(f'会话配置加载失败: {exc}')
 
     def closeEvent(self, event):
-        self._save_session()
+        session = {
+            'workspace': self.ctx.workspace,
+            'data_dir': self.ctx.data_dir,
+            'image_dir': self.ctx.image_dir,
+            'petals_dir': self.ctx.petals_dir,
+            'model_dir': self.ctx.model_dir,
+            'last_checkpoint': self.ctx.last_checkpoint,
+            'export_root': self.ctx.export_manager.root,
+        }
+        try:
+            os.makedirs(os.path.dirname(SESSION_PATH), exist_ok=True)
+            with open(SESSION_PATH, 'w', encoding='utf-8') as f:
+                json.dump(session, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
         super().closeEvent(event)
