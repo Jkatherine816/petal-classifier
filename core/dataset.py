@@ -1,65 +1,71 @@
 """
-core/dataset.py - 数据集与 DataLoader
+core/dataset.py - 数据集与数据加载
 
-目录约定：data_root/class_<类别>/*.png
-修复：旧版 Subset.labels 从未生效（Subset 无 labels 属性），类权重恒为 None；
-本版 PetalDataset 提供真正的 labels 属性，compute_class_weights 正常工作。
+相对旧版 utils/dataset.py 的修复：
+    - 删除无法运行的 _collect_from_six_in_one（类名/变量未定义）——
+      训练数据统一走"拆分落盘 -> 按类目录加载"单一路径；
+    - 图像不在 __init__ 全部读入内存，改为惰性加载（存路径，__getitem__ 再读）；
+    - 提供 labels 属性，类别权重/分层划分都能正确使用（旧版 Subset 取不到 labels）；
+    - 数据增强作用于 PIL 图像，ToTensor/Normalize 永远在最后（旧版顺序颠倒）；
+    - 训练/验证划分改为分层抽样（stratified），且训练/验证使用不同 transform。
 """
 
 import os
 import logging
 
 import numpy as np
-from PIL import Image
-
 import torch
 from torch.utils.data import Dataset, DataLoader, Subset
-from torchvision import transforms
+from PIL import Image
+import torchvision.transforms as T
 
-from .constants import (CLASSES, CLASS_TO_IDX, IDX_TO_CLASS,
-                        CLASS_DIR_PREFIX, DEFAULT_INPUT_SIZE,
-                        NORM_MEAN, NORM_STD)
+from .constants import (
+    CLASSES, CLASS_TO_IDX, IDX_TO_CLASS, CLASS_DIR_PREFIX,
+    DEFAULT_INPUT_SIZE, NORM_MEAN, NORM_STD,
+)
 
 logger = logging.getLogger(__name__)
 
-IMG_EXTS = ('.png', '.jpg', '.jpeg', '.bmp')
+IMG_EXTS = ('.png', '.jpg', '.jpeg')
 
 
 class PetalDataset(Dataset):
-    """单花瓣图像数据集（懒加载，支持任意图片总量）"""
+    """单花瓣图像数据集（按 class_<类别>/ 目录组织，惰性加载）"""
 
     def __init__(self, data_root, transform=None):
         self.data_root = data_root
         self.transform = transform
-        self.samples = []      # [(path, label_idx)]
+        self.classes = list(CLASSES)
+        self.class_to_idx = dict(CLASS_TO_IDX)
+        self.idx_to_class = dict(IDX_TO_CLASS)
+
+        self.samples = []   # [(path, label_idx)]
         self._scan()
 
+        logger.info('数据集加载: %d 个样本, 分布=%s',
+                    len(self.samples), self.class_distribution())
+
     def _scan(self):
-        for cls_name in CLASSES:
-            cls_dir = os.path.join(self.data_root,
-                                   f'{CLASS_DIR_PREFIX}{cls_name}')
-            if not os.path.isdir(cls_dir):
+        for cls in self.classes:
+            class_dir = os.path.join(self.data_root, f'{CLASS_DIR_PREFIX}{cls}')
+            if not os.path.isdir(class_dir):
                 continue
-            label = CLASS_TO_IDX[cls_name]
-            for fn in sorted(os.listdir(cls_dir)):
-                if fn.lower().endswith(IMG_EXTS):
-                    self.samples.append((os.path.join(cls_dir, fn), label))
-        dist = self.class_distribution()
-        logger.info('数据集加载: %d 个样本, 分布=%s', len(self.samples), dist)
+            for fname in sorted(os.listdir(class_dir)):
+                if fname.lower().endswith(IMG_EXTS):
+                    self.samples.append((os.path.join(class_dir, fname),
+                                         self.class_to_idx[cls]))
 
     @property
     def labels(self):
-        """修复点：旧版 Subset.labels 从未生效，这里提供真实标签数组"""
-        return [s[1] for s in self.samples]
+        """全部样本的标签索引（供类别权重/分层划分使用）"""
+        return [label for _, label in self.samples]
 
     def class_distribution(self):
-        counts = np.bincount([s[1] for s in self.samples],
-                             minlength=len(CLASSES))
-        return {CLASSES[i]: int(counts[i]) for i in range(len(CLASSES))
-                if counts[i] > 0}
-
-    def get_path(self, idx):
-        return self.samples[idx][0]
+        dist = {}
+        for _, label in self.samples:
+            name = self.idx_to_class[label]
+            dist[name] = dist.get(name, 0) + 1
+        return dist
 
     def __len__(self):
         return len(self.samples)
@@ -71,45 +77,66 @@ class PetalDataset(Dataset):
             img = self.transform(img)
         return img, label
 
+    def get_path(self, idx):
+        return self.samples[idx][0]
 
+
+# ---------------------------------------------------------------- 变换
 def build_train_transform(input_size=DEFAULT_INPUT_SIZE, aug_level='medium',
                           mean=NORM_MEAN, std=NORM_STD):
-    """训练用数据增强。注意：ToTensor/Normalize 必须在最后（PIL 增强先于张量化）。"""
-    ops = [transforms.Resize((input_size, input_size))]
-    if aug_level in ('light', 'medium', 'heavy'):
-        ops.append(transforms.RandomHorizontalFlip())
-        ops.append(transforms.RandomVerticalFlip())
-    if aug_level in ('medium', 'heavy'):
-        ops.append(transforms.RandomRotation(15))
-        ops.append(transforms.RandomAffine(
-            degrees=0, translate=(0.05, 0.05), scale=(0.95, 1.05)))
-    if aug_level == 'heavy':
-        ops.append(transforms.RandomRotation(15))
-        ops.append(transforms.ColorJitter(brightness=0.15, contrast=0.15))
-    ops.append(transforms.ToTensor())
-    ops.append(transforms.Normalize(mean, std))
-    return transforms.Compose(ops)
+    """训练变换：先 PIL 增强，最后 ToTensor + Normalize。"""
+    aug_level = (aug_level or 'none').lower()
+    pil_ops = []
+    if aug_level == 'light':
+        pil_ops = [
+            T.RandomHorizontalFlip(p=0.3),
+            T.RandomRotation(10),
+            T.ColorJitter(brightness=0.1, contrast=0.1),
+        ]
+    elif aug_level == 'medium':
+        pil_ops = [
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomVerticalFlip(p=0.2),
+            T.RandomRotation(20),
+            T.ColorJitter(brightness=0.2, contrast=0.2),
+            T.RandomResizedCrop(input_size, scale=(0.8, 1.0)),
+        ]
+    elif aug_level == 'heavy':
+        pil_ops = [
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomVerticalFlip(p=0.3),
+            T.RandomRotation(30),
+            T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.2),
+            T.RandomResizedCrop(input_size, scale=(0.7, 1.0)),
+            T.RandomApply([T.GaussianBlur(3)], p=0.2),
+        ]
+    return T.Compose(pil_ops + [
+        T.Resize((input_size, input_size)),
+        T.ToTensor(),
+        T.Normalize(mean=mean, std=std),
+    ])
 
 
 def build_eval_transform(input_size=DEFAULT_INPUT_SIZE,
                          mean=NORM_MEAN, std=NORM_STD):
-    return transforms.Compose([
-        transforms.Resize((input_size, input_size)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std),
+    """评估/预测变换：不做任何随机增强。"""
+    return T.Compose([
+        T.Resize((input_size, input_size)),
+        T.ToTensor(),
+        T.Normalize(mean=mean, std=std),
     ])
 
 
-def compute_class_weights(labels):
-    """逆频率归一化类权重（mean=1），用于 CrossEntropyLoss"""
-    counts = np.bincount(np.asarray(labels), minlength=len(CLASSES)) \
-        .astype(np.float64)
-    counts = np.maximum(counts, 1.0)
+def compute_class_weights(labels, num_classes=len(CLASSES)):
+    """由标签列表计算类别权重（逆频率，归一化使均值为 1）。"""
+    counts = np.bincount(np.asarray(labels), minlength=num_classes).astype(np.float64)
+    counts[counts == 0] = 1.0          # 防止除零
     weights = 1.0 / counts
     weights = weights / weights.mean()
-    return torch.tensor(weights, dtype=torch.float32), counts.astype(int)
+    return torch.FloatTensor(weights), counts.astype(int)
 
 
+# ---------------------------------------------------------------- DataLoader
 def create_dataloaders(data_root, batch_size=32, val_split=0.2,
                        aug_level='medium', input_size=DEFAULT_INPUT_SIZE,
                        mean=NORM_MEAN, std=NORM_STD, seed=42,
@@ -170,15 +197,17 @@ def create_dataloaders(data_root, batch_size=32, val_split=0.2,
         'preprocess': {'input_size': input_size, 'mean': list(mean),
                        'std': list(std)},
     }
+    logger.info('训练集 %d / 验证集 %d，类别计数 %s',
+                len(train_idx), len(val_idx), class_counts.tolist())
     return train_loader, val_loader, info
 
 
-def create_predict_loader(data_root, input_size=DEFAULT_INPUT_SIZE,
-                          mean=NORM_MEAN, std=NORM_STD,
-                          batch_size=64, num_workers=0):
-    """评估/预测用 loader（无增强）。返回 (loader, dataset)。"""
-    ds = PetalDataset(data_root,
-                      transform=build_eval_transform(input_size, mean, std))
+def create_predict_loader(data_root, batch_size=32,
+                          input_size=DEFAULT_INPUT_SIZE,
+                          mean=NORM_MEAN, std=NORM_STD, num_workers=2):
+    """预测/评估用：全量数据集 + 评估变换。"""
+    ds = PetalDataset(data_root, transform=build_eval_transform(
+        input_size, mean, std))
     loader = DataLoader(ds, batch_size=batch_size, shuffle=False,
                         num_workers=num_workers)
     return loader, ds

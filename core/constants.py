@@ -35,33 +35,47 @@ SECTOR_ANGLES = [
     (300, 360),  # 扇形 5
 ]
 SECTOR_CENTERS = [30, 90, 150, 210, 270, 330]
+NUM_SECTORS = 6
 
-# 花瓣位置 -> 异常类型（模式A固定异常图：位置 i 放置第 i 种异常）
+# 模式A固定位置：扇形位置 -> 异常类型
 POSITION_TO_TYPE = {
-    0: 'outlier', 1: 'constant', 2: 'trend',
-    3: 'missing', 4: 'bias', 5: 'staircase',
+    0: 'outlier',
+    1: 'constant',
+    2: 'trend',
+    3: 'missing',
+    4: 'bias',
+    5: 'staircase',
 }
+TYPE_TO_POSITION = {v: k for k, v in POSITION_TO_TYPE.items()}
 
-# ---------------------------------------------------------------- 渲染参数
-# 训练/预测统一单色（修复旧版"颜色捷径"：旧版训练彩色、预测灰色，
-# 模型学到的是颜色而非形状）；彩色仅用于人工预览。
-MONO_COLOR = '#4A4A4A'
-CLASS_COLORS = {           # 仅预览/测试用，禁止用于训练与预测数据
-    'normal': '#2ca02c', 'outlier': '#d62728', 'constant': '#1f77b4',
-    'trend': '#ff7f0e', 'missing': '#9467bd', 'bias': '#8c564b',
-    'staircase': '#e377c2',
+# ---------------------------------------------------------------- 颜色（仅人工预览用）
+# 注意：训练管线的图像一律单色渲染（MONO_COLOR），彩色只允许用于人工预览，
+# 绝不允许进入训练/预测数据流，否则模型会学到"颜色捷径"。
+CLASS_COLORS = {
+    'outlier': '#FF6B6B',
+    'constant': '#4ECDC4',
+    'trend': '#45B7D1',
+    'missing': '#96CEB4',
+    'bias': '#FFEAA7',
+    'staircase': '#DDA0DD',
+    'normal': '#CCCCCC',
 }
+MONO_COLOR = '#4A4A4A'  # 训练/预测统一单色（深灰）
 
-DEFAULT_IMAGE_SIZE = 224        # 六合一图像边长
-DEFAULT_INPUT_SIZE = 64         # 模型输入边长
-DEFAULT_SEGMENT_LENGTH = 6000   # 每瓣取信号前 N 点
-DEFAULT_TAU = 3                 # SDP 时间延迟
+# ---------------------------------------------------------------- 默认参数
+DEFAULT_SIGNAL_LENGTH = 50000       # 信号长度 L
+DEFAULT_SAMPLING_RATE = 20          # 采样频率 Fs
+DEFAULT_SEGMENT_LENGTH = 6000       # 渲染截取的数据段长度
+DEFAULT_TAU = 3                     # SDP 时间延迟
+DEFAULT_IMAGE_SIZE = 224            # 六合一图像尺寸
 DEFAULT_DPI = 100
+DEFAULT_PETAL_SIZE = 64             # 拆分花瓣输出尺寸（模型输入尺寸）
+DEFAULT_INPUT_SIZE = 64
 
-# 归一化参数（与旧版一致，写进 checkpoint 的 preprocess）
+# 归一化参数（统一约定，写入 checkpoint 随模型走）
 NORM_MEAN = (0.5, 0.5, 0.5)
 NORM_STD = (0.5, 0.5, 0.5)
 
 # ---------------------------------------------------------------- 目录约定
-CLASS_DIR_PREFIX = 'class_'     # class_normal / class_outlier / ...
-METADATA_SUFFIX = '_metadata.json'
+CLASS_DIR_PREFIX = 'class_'         # 类别目录前缀：class_normal / ...
+METADATA_SUFFIX = '_metadata.json'  # 六合一图像元数据后缀
