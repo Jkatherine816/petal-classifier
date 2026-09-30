@@ -41,10 +41,10 @@ python main.py
 
 ```bash
 python cli.py generate --output data/raw --count 100 --length 6000 --seed 42
-python cli.py render   --input data/raw --output data/images --num 200
+python cli.py render   --input data/raw --output data/images --num 200   # 域随机化默认开启，--no-randomize 关闭
 python cli.py split    --input data/images --output data/petals --grayscale
 python cli.py split    --input data/raw --output data/petals --fast   # 快速路径（跳过六合一）
-python cli.py train    --data data/petals --output models/run --model enhanced --epochs 50 --batch_size 32 --amp
+python cli.py train    --data data/petals --output models/run --model enhanced --epochs 50 --batch_size 32 --amp --input_size 96 --label_smoothing 0.1
 python cli.py evaluate --model models/run/best_model.pth --data data/petals
 python cli.py predict  --model models/run/best_model.pth --input 待测npy文件夹 --output predictions
 ```
@@ -69,7 +69,7 @@ petal_classifier/
 ├── training/                # Trainer（AMP/调度器/早停回调）+ 评估器（指标与图表）
 ├── inference/               # Predictor（自动匹配 checkpoint 预处理、标注、导出）
 ├── gui/                     # PySide6 界面：widgets / pages / workers / main_window
-├── tests/                   # pytest 回归（9 项，含镜像修复回归测试）
+├── tests/                   # pytest 回归（11 项，含镜像修复/域随机化回归测试）
 └── configs/                 # GUI 会话自动保存
 ```
 
@@ -91,6 +91,16 @@ petal_classifier/
 7. **checkpoint 自描述**：保存 model_type / model_config / classes / preprocess，
    预测时自动还原输入尺寸与归一化，不再靠猜。
 8. **信号生成慢**：staircase 量化由 Python 循环改为向量化。
+9. **泛化性（防"参数指纹"捷径学习）**：固定渲染参数会让模型记住点密度/纹理
+   而非形状，换一组参数准确率即崩。现采用四层措施：
+   - **域随机化**（默认开启）：训练图逐花瓣随机采样
+     segment_length∈[3000,12000] / tau∈[2,10] / jitter∈[0.2,1.0]，
+     采样值写入元数据 render_params 可追溯（`--no-randomize` 可关闭）；
+   - **增强升级**：RandomErasing 张量级擦除模拟密度漂移 + 更强 RandomResizedCrop；
+   - **输入分辨率 96**（原 64）：`--input_size 96`，保留更多形状细节；
+   - **标签平滑 0.1**：`--label_smoothing 0.1`，改善置信度校准；
+   - **渲染参数随 checkpoint 走**：训练时写入 preprocess.render，
+     预测（模式B）按同参数渲染，保证训练/预测同分布。
 
 ## 四、已知边界
 
@@ -102,7 +112,7 @@ petal_classifier/
 ## 五、测试
 
 ```bash
-QT_QPA_PLATFORM=offscreen python -m pytest tests/ -q    # 9 项回归
+QT_QPA_PLATFORM=offscreen python -m pytest tests/ -q    # 11 项回归（含域随机化）
 ```
 
 ## 六、获取 Windows EXE（云端自动打包，免部署分发）
