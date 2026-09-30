@@ -155,6 +155,15 @@ class Trainer:
 
 
 # ------------------------------------------------------------ 便捷构造函数
+def make_criterion(class_weights=None, device='cpu', label_smoothing=0.1):
+    """
+    构造交叉熵损失。label_smoothing 防止对"参数指纹"过度自信，
+    改善跨参数泛化时的置信度校准（0 = 关闭）。
+    """
+    weight = class_weights.to(device) if class_weights is not None else None
+    return nn.CrossEntropyLoss(weight=weight, label_smoothing=label_smoothing)
+
+
 def make_optimizer(model, lr=1e-4, weight_decay=1e-4, only_trainable=True):
     params = (p for p in model.parameters()
               if (p.requires_grad or not only_trainable))
