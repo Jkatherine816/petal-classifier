@@ -19,7 +19,7 @@ from PIL import Image
 
 from core.constants import (
     CLASSES, CLASS_COLORS, SECTOR_CENTERS, METADATA_SUFFIX,
-    DEFAULT_INPUT_SIZE, NORM_MEAN, NORM_STD,
+    DEFAULT_INPUT_SIZE, NORM_MEAN, NORM_STD, STANDARD_RENDER_PARAMS,
 )
 from core.dataset import build_eval_transform
 from core.petal_splitter import PetalSplitter, find_metadata_for
@@ -65,6 +65,12 @@ class Predictor:
         mean = tuple(preprocess.get('mean', NORM_MEAN))
         std = tuple(preprocess.get('std', NORM_STD))
         self.transform = build_eval_transform(self.input_size, mean, std)
+
+        # 渲染参数自描述：预测（模式B）按 checkpoint 记录的参数渲染，
+        # 保证训练/预测同分布；旧 checkpoint 缺省时回退到标准参数
+        render = dict(STANDARD_RENDER_PARAMS)
+        render.update(preprocess.get('render') or {})
+        self.render_params = render
 
         self.splitter = PetalSplitter(output_size=max(self.input_size, 64))
         logger.info('预测器就绪: %s (%s, 输入 %dx%d, 设备 %s)',
@@ -132,7 +138,11 @@ class Predictor:
         返回 {'images': [{image_path, results}], 'summary': {...}}
         """
         work_dir = work_dir or os.path.join(data_folder, '_predict_images')
-        renderer = SDPRenderer()
+        renderer = SDPRenderer(
+            image_size=int(self.render_params.get('image_size', 224)),
+            segment_length=int(self.render_params.get('segment_length', 6000)),
+            tau=int(self.render_params.get('tau', 3)),
+            jitter=float(self.render_params.get('jitter', 0.5)))
         image_list = renderer.generate_mode_B(data_folder, work_dir)
         if not image_list:
             return {'images': [], 'summary': {}}

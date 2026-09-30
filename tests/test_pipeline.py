@@ -130,3 +130,34 @@ class TestFastPath:
         stats = SDPRenderer(seed=0).render_single_petals(tiny_dataset, str(out))
         assert set(stats) == set(CLASSES)
         assert all(v == 3 for v in stats.values())
+
+
+class TestDomainRandomization:
+    """域随机化：开启后逐花瓣采样渲染参数，且参数写入元数据可追溯"""
+
+    def test_randomize_varies_params(self, tiny_dataset, tmp_path_factory):
+        out = tmp_path_factory.mktemp('rand')
+        SDPRenderer(seed=1, randomize=True).generate_mode_A(
+            tiny_dataset, str(out), num_images=4)
+        meta_path = os.path.join(str(out),
+                                 'train_fixed_0000_metadata.json')
+        with open(meta_path, encoding='utf-8') as f:
+            meta = json.load(f)
+        assert meta['randomize'] is True
+        params = [p['render_params'] for p in meta['petals'] if p['has_data']]
+        assert len(params) == 6
+        # 6 个花瓣的采样参数不应全部相同（域随机化生效）
+        seg_lengths = {p['segment_length'] for p in params}
+        assert len(seg_lengths) > 1
+
+    def test_no_randomize_fixed_params(self, tiny_dataset, tmp_path_factory):
+        out = tmp_path_factory.mktemp('fixed')
+        SDPRenderer(seed=1, randomize=False).generate_mode_A(
+            tiny_dataset, str(out), num_images=2)
+        meta_path = os.path.join(str(out),
+                                 'train_fixed_0000_metadata.json')
+        with open(meta_path, encoding='utf-8') as f:
+            meta = json.load(f)
+        params = [p['render_params'] for p in meta['petals'] if p['has_data']]
+        assert len({p['segment_length'] for p in params}) == 1
+        assert len({p['tau'] for p in params}) == 1

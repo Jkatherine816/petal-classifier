@@ -5,7 +5,6 @@ gui/pages/page_train.py - ④ 模型训练页
 import os
 
 import torch
-import torch.nn as nn
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox,
@@ -13,10 +12,11 @@ from PySide6.QtWidgets import (QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox,
                                QMessageBox)
 
 from core.dataset import create_dataloaders
-from core.constants import NORM_MEAN, NORM_STD, DEFAULT_INPUT_SIZE
+from core.constants import (NORM_MEAN, NORM_STD, DEFAULT_INPUT_SIZE,
+                            STANDARD_RENDER_PARAMS)
 from models.registry import build_model, MODEL_REGISTRY
-from training.trainer import Trainer, make_optimizer, make_scheduler, \
-    load_pretrained_compatible
+from training.trainer import (Trainer, make_criterion, make_optimizer,
+                              make_scheduler, load_pretrained_compatible)
 from training.evaluator import plot_training_curves
 from gui.widgets.curve_canvas import CurveCanvas
 from gui.workers import TrainWorker
@@ -61,6 +61,19 @@ class TrainPage(BasePage):
         self.spin_val.setValue(0.2)
         self.spin_val.setSingleStep(0.05)
         self.form.addRow('验证集比例', self.spin_val)
+
+        self.combo_input = QComboBox()
+        self.combo_input.addItems(['64', '96', '128'])
+        self.combo_input.setCurrentText('96')
+        self.form.addRow('输入尺寸', self.combo_input)
+
+        self.spin_smooth = QDoubleSpinBox()
+        self.spin_smooth.setDecimals(2)
+        self.spin_smooth.setRange(0.0, 0.3)
+        self.spin_smooth.setValue(0.1)
+        self.spin_smooth.setSingleStep(0.05)
+        self.spin_smooth.setToolTip('标签平滑：防模型对参数指纹过度自信，0 关闭')
+        self.form.addRow('标签平滑', self.spin_smooth)
 
         self.combo_aug = QComboBox()
         self.combo_aug.addItems(['none', 'light', 'medium', 'heavy'])
@@ -121,6 +134,7 @@ class TrainPage(BasePage):
                 data_dir, batch_size=self.spin_batch.value(),
                 val_split=self.spin_val.value(),
                 aug_level=self.combo_aug.currentText(),
+                input_size=int(self.combo_input.currentText()),
                 num_workers=0)
         except Exception as exc:
             QMessageBox.critical(self, '数据加载失败', str(exc))
@@ -139,12 +153,9 @@ class TrainPage(BasePage):
                 model.freeze_feature_stages(n_freeze)
                 print(f'已冻结前 {n_freeze} 个特征阶段')
 
-        if info['class_weights'] is not None:
-            criterion = nn.CrossEntropyLoss(
-                weight=info['class_weights'].to(torch.device(
-                    'cuda' if torch.cuda.is_available() else 'cpu')))
-        else:
-            criterion = nn.CrossEntropyLoss()
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        criterion = make_criterion(info['class_weights'], device,
+                                   label_smoothing=self.spin_smooth.value())
 
         optimizer = make_optimizer(model, lr=self.spin_lr.value())
         sched_kind = self.combo_sched.currentText()
@@ -159,11 +170,15 @@ class TrainPage(BasePage):
         self.btn_stop.setEnabled(True)
         self.progress.setValue(0)
 
+        # 渲染参数写入 checkpoint：预测时按此渲染，保证训练/预测同分布
+        preprocess = dict(info['preprocess'])
+        preprocess['render'] = dict(STANDARD_RENDER_PARAMS)
+
         self.train_worker = TrainWorker(
             trainer, train_loader, val_loader, self.spin_epochs.value(),
             save_kwargs={'save_dir': out_dir, 'model_type': model_type,
                          'model_config': model_cfg,
-                         'preprocess': info['preprocess'],
+                         'preprocess': preprocess,
                          'classes': info['classes']},
             parent=self)
         self.train_worker.progress.connect(
