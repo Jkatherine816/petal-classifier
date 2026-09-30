@@ -40,6 +40,11 @@ class RenderPage(BasePage):
         self.chk_colorful.setChecked(False)
         self.form.addRow('', self.chk_colorful)
 
+        self.chk_randomize = QCheckBox(
+            '域随机化（训练推荐开启：随机渲染参数，防模型记"参数指纹"）')
+        self.chk_randomize.setChecked(True)
+        self.form.addRow('', self.chk_randomize)
+
         self.edit_out = self.add_dir_row(
             '输出目录', self.ctx.default_path('images'),
             '六合一图像与元数据输出目录')
@@ -70,7 +75,8 @@ class RenderPage(BasePage):
         out_dir = self.edit_out.text().strip()
         if not in_dir or not out_dir:
             return
-        renderer = SDPRenderer(image_size=self.spin_size.value())
+        renderer = SDPRenderer(image_size=self.spin_size.value(),
+                               randomize=self.chk_randomize.isChecked())
         self.run_task(renderer.generate_mode_A, in_dir, out_dir,
                       self.spin_num.value(),
                       self.chk_colorful.isChecked(),
@@ -102,6 +108,7 @@ class RenderPage(BasePage):
             description='六合一 SDP 训练图像',
             params={'num_images': self.spin_num.value(),
                     'image_size': self.spin_size.value(),
-                    'colorful': self.chk_colorful.isChecked()})
+                    'colorful': self.chk_colorful.isChecked(),
+                    'randomize': self.chk_randomize.isChecked()})
         if dest:
             print(f'已导出到 {dest}')

@@ -31,7 +31,8 @@ def cmd_generate(args):
 
 def cmd_render(args):
     from core.sdp_renderer import SDPRenderer
-    renderer = SDPRenderer(image_size=args.image_size)
+    renderer = SDPRenderer(image_size=args.image_size,
+                           randomize=args.randomize)
     renderer.generate_mode_A(args.input, args.output, args.num,
                              colorful=args.colorful)
 
@@ -39,7 +40,8 @@ def cmd_render(args):
 def cmd_split(args):
     if args.fast:
         from core.sdp_renderer import SDPRenderer
-        SDPRenderer().render_single_petals(args.input, args.output)
+        SDPRenderer(randomize=args.randomize).render_single_petals(
+            args.input, args.output)
     else:
         from core.petal_splitter import PetalSplitter
         PetalSplitter().batch_split(args.input, args.output,
@@ -48,16 +50,17 @@ def cmd_split(args):
 
 def cmd_train(args):
     import torch
-    import torch.nn as nn
     from core.dataset import create_dataloaders
+    from core.constants import STANDARD_RENDER_PARAMS
     from models.registry import build_model
-    from training.trainer import (Trainer, make_optimizer, make_scheduler,
-                                  load_pretrained_compatible)
+    from training.trainer import (Trainer, make_criterion, make_optimizer,
+                                  make_scheduler, load_pretrained_compatible)
     from training.evaluator import plot_training_curves
 
     train_loader, val_loader, info = create_dataloaders(
         args.data, batch_size=args.batch_size, val_split=args.val_split,
-        aug_level=args.augmentation, num_workers=args.workers)
+        aug_level=args.augmentation, input_size=args.input_size,
+        num_workers=args.workers)
 
     model, model_cfg = build_model(args.model, info['num_classes'])
     if args.pretrained:
@@ -67,19 +70,22 @@ def cmd_train(args):
             model.freeze_feature_stages(args.freeze)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    weights = info['class_weights']
-    criterion = nn.CrossEntropyLoss(
-        weight=weights.to(device)) if weights is not None else nn.CrossEntropyLoss()
+    criterion = make_criterion(info['class_weights'], device,
+                               label_smoothing=args.label_smoothing)
     optimizer = make_optimizer(model, lr=args.learning_rate)
     scheduler = None if args.scheduler == 'none' else make_scheduler(
         optimizer, args.scheduler, args.epochs)
+
+    # 渲染参数写入 checkpoint：预测时按此渲染，保证训练/预测同分布
+    preprocess = dict(info['preprocess'])
+    preprocess['render'] = dict(STANDARD_RENDER_PARAMS)
 
     trainer = Trainer(model, device=device, criterion=criterion,
                       optimizer=optimizer, scheduler=scheduler, amp=args.amp)
     history, best, _ = trainer.fit(
         train_loader, val_loader, args.epochs,
         save_dir=args.output, model_type=args.model, model_config=model_cfg,
-        preprocess=info['preprocess'], classes=info['classes'])
+        preprocess=preprocess, classes=info['classes'])
 
     if history['train_loss']:
         plot_training_curves(history, os.path.join(args.output,
@@ -148,7 +154,9 @@ def main():
     p.add_argument('--image_size', type=int, default=224)
     p.add_argument('--colorful', action='store_true',
                    help='彩色预览（勿用于训练）')
-    p.set_defaults(func=cmd_render)
+    p.add_argument('--no-randomize', dest='randomize', action='store_false',
+                   help='关闭域随机化（默认开启，训练推荐保持开启）')
+    p.set_defaults(func=cmd_render, randomize=True)
 
     p = sub.add_parser('split', help='花瓣拆分 / 快速路径渲染')
     p.add_argument('--input', required=True)
@@ -156,7 +164,9 @@ def main():
     p.add_argument('--fast', action='store_true',
                    help='快速路径：npy 直渲染单花瓣')
     p.add_argument('--grayscale', action='store_true', help='输出转灰度')
-    p.set_defaults(func=cmd_split)
+    p.add_argument('--no-randomize', dest='randomize', action='store_false',
+                   help='快速路径关闭域随机化（默认开启）')
+    p.set_defaults(func=cmd_split, randomize=True)
 
     p = sub.add_parser('train', help='训练模型')
     p.add_argument('--data', required=True)
@@ -167,6 +177,10 @@ def main():
     p.add_argument('--batch_size', type=int, default=32)
     p.add_argument('--learning_rate', type=float, default=1e-4)
     p.add_argument('--val_split', type=float, default=0.2)
+    p.add_argument('--input_size', type=int, default=96,
+                   help='模型输入尺寸（默认 96，比 64 保留更多形状细节）')
+    p.add_argument('--label_smoothing', type=float, default=0.1,
+                   help='标签平滑系数（0 关闭，防过度自信）')
     p.add_argument('--augmentation', default='medium',
                    choices=['none', 'light', 'medium', 'heavy'])
     p.add_argument('--scheduler', default='plateau',

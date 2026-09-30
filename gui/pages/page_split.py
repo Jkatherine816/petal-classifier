@@ -85,7 +85,7 @@ class SplitPage(BasePage):
 
         fast = self.combo_mode.currentIndex() == 1
         if fast:
-            renderer = SDPRenderer()
+            renderer = SDPRenderer(randomize=True)  # 训练图域随机化
             self.run_task(renderer.render_single_petals, in_dir, out_dir,
                           on_done=lambda stats: self._show_results(out_dir, stats))
         else:
