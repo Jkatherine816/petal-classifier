@@ -67,10 +67,24 @@ DEFAULT_SIGNAL_LENGTH = 50000       # 信号长度 L
 DEFAULT_SAMPLING_RATE = 20          # 采样频率 Fs
 DEFAULT_SEGMENT_LENGTH = 6000       # 渲染截取的数据段长度
 DEFAULT_TAU = 3                     # SDP 时间延迟
+DEFAULT_JITTER = 0.5                # 花瓣角度抖动标准差（度）
 DEFAULT_IMAGE_SIZE = 224            # 六合一图像尺寸
 DEFAULT_DPI = 100
-DEFAULT_PETAL_SIZE = 64             # 拆分花瓣输出尺寸（模型输入尺寸）
-DEFAULT_INPUT_SIZE = 64
+DEFAULT_PETAL_SIZE = 96             # 拆分花瓣输出尺寸
+DEFAULT_INPUT_SIZE = 96             # 模型输入尺寸（96 保留更多形状细节）
+
+# 域随机化范围（训练数据渲染时逐花瓣随机采样，防"参数指纹"捷径学习）
+RAND_SEGMENT_RANGE = (3000, 12000)  # 截取段长：0.5x ~ 2x 默认值
+RAND_TAU_RANGE = (2, 10)            # 时间延迟
+RAND_JITTER_RANGE = (0.2, 1.0)      # 角度抖动
+
+# 标准渲染参数（写入 checkpoint，预测/评估时按此渲染保证同分布）
+STANDARD_RENDER_PARAMS = {
+    'segment_length': DEFAULT_SEGMENT_LENGTH,
+    'tau': DEFAULT_TAU,
+    'jitter': DEFAULT_JITTER,
+    'image_size': DEFAULT_IMAGE_SIZE,
+}
 
 # 归一化参数（统一约定，写入 checkpoint 随模型走）
 NORM_MEAN = (0.5, 0.5, 0.5)

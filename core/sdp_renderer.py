@@ -11,6 +11,9 @@ core/sdp_renderer.py - SDP 六合一图像渲染器
     - 角度/颜色/类别定义全部来自 core.constants。
     - 新增快速路径 render_single_petals：信号直接渲染为单花瓣训练图，
       跳过"六合一 -> 拆分"往返（可选，详见 GUI 拆分页开关）。
+    - 域随机化（randomize=True，训练推荐）：逐花瓣随机采样
+      segment_length / tau / jitter，防止模型记忆"参数指纹"（点密度/纹理），
+      被迫学习对参数不变的形状特征。采样值写入元数据 render_params 可追溯。
 """
 
 import os
@@ -27,7 +30,8 @@ from .constants import (
     CLASSES, CLASS_DIR_PREFIX, METADATA_SUFFIX,
     SECTOR_ANGLES, POSITION_TO_TYPE, CLASS_COLORS, MONO_COLOR,
     DEFAULT_IMAGE_SIZE, DEFAULT_DPI, DEFAULT_SEGMENT_LENGTH, DEFAULT_TAU,
-    DEFAULT_PETAL_SIZE,
+    DEFAULT_PETAL_SIZE, DEFAULT_JITTER,
+    RAND_SEGMENT_RANGE, RAND_TAU_RANGE, RAND_JITTER_RANGE,
 )
 from .signal_generator import load_npy, load_dataset_index
 from .image_utils import crop_and_square
@@ -40,15 +44,35 @@ class SDPRenderer:
 
     def __init__(self, image_size=DEFAULT_IMAGE_SIZE, dpi=DEFAULT_DPI,
                  segment_length=DEFAULT_SEGMENT_LENGTH, tau=DEFAULT_TAU,
-                 seed=None):
+                 jitter=DEFAULT_JITTER, seed=None, randomize=False):
         self.image_size = image_size
         self.dpi = dpi
         self.segment_length = segment_length
         self.tau = tau
+        self.jitter = jitter
+        self.randomize = randomize
         self.rng = np.random.default_rng(seed)
 
+    # ------------------------------------------------------------ 域随机化
+    def _sample_params(self):
+        """
+        采样一组渲染参数。randomize=True 时在配置范围内随机（训练用）；
+        否则返回固定实例参数（预测/评估用，保证与 checkpoint 同分布）。
+        """
+        if not self.randomize:
+            return {'segment_length': self.segment_length,
+                    'tau': self.tau, 'jitter': self.jitter}
+        return {
+            'segment_length': int(self.rng.integers(
+                RAND_SEGMENT_RANGE[0], RAND_SEGMENT_RANGE[1] + 1)),
+            'tau': int(self.rng.integers(
+                RAND_TAU_RANGE[0], RAND_TAU_RANGE[1] + 1)),
+            'jitter': float(self.rng.uniform(
+                RAND_JITTER_RANGE[0], RAND_JITTER_RANGE[1])),
+        }
+
     # ------------------------------------------------------------ 数据 -> 点集
-    def preprocess(self, data):
+    def preprocess(self, data, segment_length=None, tau=None):
         """
         时序数据 -> (radius, y)。
         截取 segment_length 段，归一化到 [0,1]，按 tau 构造 SDP 延迟对。
@@ -56,25 +80,30 @@ class SDPRenderer:
         if data is None or len(data) == 0:
             return None, None
 
-        segment = data[:self.segment_length] if len(data) > self.segment_length else data
+        seg = segment_length or self.segment_length
+        t = self.tau if tau is None else tau
+
+        segment = data[:seg] if len(data) > seg else data
         d_min, d_max = np.min(segment), np.max(segment)
         norm = (segment - d_min) / (d_max - d_min) if d_max > d_min else np.zeros_like(segment)
 
-        if len(norm) <= self.tau:
+        if len(norm) <= t:
             return None, None
-        y = norm[self.tau:]
+        y = norm[t:]
         radius = norm[:len(y)]
         if len(radius) <= 10:
             return None, None
         return radius, y
 
-    def petal_points(self, radius, y, angle_range):
+    def petal_points(self, radius, y, angle_range, jitter=None):
         """
         (radius, y) -> 扇形内的 (theta_rad, r)。纯几何映射，不做任何类别相关增强。
-        角度由 y 的归一化值映射到扇形中部 80% 范围，并叠加微小抖动。
+        角度由 y 的归一化值映射到扇形中部 80% 范围，并叠加抖动（幅度可调）。
         """
         if radius is None or y is None or len(radius) < 10:
             return None, None
+
+        j = self.jitter if jitter is None else jitter
 
         if np.max(y) > np.min(y):
             y_norm = (y - np.min(y)) / (np.max(y) - np.min(y))
@@ -84,14 +113,19 @@ class SDPRenderer:
         start, end = angle_range
         width = end - start
         theta_deg = start + width * 0.1 + y_norm * width * 0.8
-        theta_deg += self.rng.normal(0, 0.5, len(theta_deg))
+        theta_deg += self.rng.normal(0, j, len(theta_deg))
         theta_deg = np.clip(theta_deg, start, end)
         return np.deg2rad(theta_deg), np.clip(radius, 0, 1)
 
-    def signal_to_petal(self, data, angle_range):
-        """单条信号 -> (theta, r)；数据无效时返回 (None, None)。"""
-        radius, y = self.preprocess(data)
-        return self.petal_points(radius, y, angle_range)
+    def signal_to_petal(self, data, angle_range, params=None):
+        """
+        单条信号 -> (theta, r)；数据无效时返回 (None, None)。
+        params 可指定 {'segment_length','tau','jitter'}，缺省用实例参数。
+        """
+        p = params or {'segment_length': self.segment_length,
+                       'tau': self.tau, 'jitter': self.jitter}
+        radius, y = self.preprocess(data, p.get('segment_length'), p.get('tau'))
+        return self.petal_points(radius, y, angle_range, p.get('jitter'))
 
     # ------------------------------------------------------------ 极坐标绘图
     def _render_polar(self, point_sets, output_path):
@@ -149,6 +183,8 @@ class SDPRenderer:
         模式A：生成训练图像（固定位置）。
         前半为"六扇形各放一种异常"，后半为"六花瓣全正常"。
         colorful=False（默认，训练用）；True 仅用于人工预览/回归测试。
+        randomize=True 时逐花瓣随机采样渲染参数（域随机化，防参数指纹捷径），
+        每个花瓣实际使用的参数写入元数据 render_params 字段。
         """
         os.makedirs(output_dir, exist_ok=True)
         data_index = load_dataset_index(data_root)
@@ -164,8 +200,9 @@ class SDPRenderer:
             if progress_cb:
                 progress_cb(int(done / total * 100), msg)
 
-        logger.info('模式A：生成 %d 张固定异常图 + %d 张全正常图（%s）',
-                    n_anomaly, n_normal, '彩色预览' if colorful else '单色')
+        logger.info('模式A：生成 %d 张固定异常图 + %d 张全正常图（%s，域随机化=%s）',
+                    n_anomaly, n_normal,
+                    '彩色预览' if colorful else '单色', self.randomize)
 
         for img_idx in range(n_anomaly):
             point_sets, petals_meta = [], []
@@ -174,10 +211,12 @@ class SDPRenderer:
                 files = data_index.get(ptype, [])
                 theta, r = (None, None)
                 data_file = None
+                params = self._sample_params()
                 if files:
                     data_file = files[int(self.rng.integers(0, len(files)))]
                     theta, r = self.signal_to_petal(load_npy(data_file),
-                                                    SECTOR_ANGLES[sector_idx])
+                                                    SECTOR_ANGLES[sector_idx],
+                                                    params)
                 has_data = theta is not None
                 point_sets.append((theta, r, self._color_for(ptype, colorful)))
                 petals_meta.append({
@@ -185,13 +224,15 @@ class SDPRenderer:
                     'true_label': ptype if has_data else None,
                     'has_data': has_data,
                     'angle_range': list(SECTOR_ANGLES[sector_idx]),
+                    'render_params': params,
                 })
 
             out_path = os.path.join(output_dir, f'train_fixed_{img_idx:04d}.png')
             self._render_polar(point_sets, out_path)
             self._write_metadata(out_path, {
                 'generation_mode': 'A', 'image_type': 'fixed_anomalies',
-                'colorful': colorful, 'petals': petals_meta})
+                'colorful': colorful, 'randomize': self.randomize,
+                'petals': petals_meta})
             tick(f'固定异常图 {img_idx + 1}/{n_anomaly}')
 
         normal_files = data_index.get('normal', [])
@@ -200,10 +241,12 @@ class SDPRenderer:
             for sector_idx in range(6):
                 theta, r = (None, None)
                 data_file = None
+                params = self._sample_params()
                 if normal_files:
                     data_file = normal_files[int(self.rng.integers(0, len(normal_files)))]
                     theta, r = self.signal_to_petal(load_npy(data_file),
-                                                    SECTOR_ANGLES[sector_idx])
+                                                    SECTOR_ANGLES[sector_idx],
+                                                    params)
                 has_data = theta is not None
                 point_sets.append((theta, r, self._color_for('normal', colorful)))
                 petals_meta.append({
@@ -211,13 +254,15 @@ class SDPRenderer:
                     'true_label': 'normal' if has_data else None,
                     'has_data': has_data,
                     'angle_range': list(SECTOR_ANGLES[sector_idx]),
+                    'render_params': params,
                 })
 
             out_path = os.path.join(output_dir, f'train_normal_{img_idx:04d}.png')
             self._render_polar(point_sets, out_path)
             self._write_metadata(out_path, {
                 'generation_mode': 'A', 'image_type': 'all_normal',
-                'colorful': colorful, 'petals': petals_meta})
+                'colorful': colorful, 'randomize': self.randomize,
+                'petals': petals_meta})
             tick(f'全正常图 {img_idx + 1}/{n_normal}')
 
         logger.info('模式A完成：%d 张图像 -> %s', num_images, output_dir)
@@ -229,6 +274,8 @@ class SDPRenderer:
         """
         模式B：把文件夹内的 .npy 按文件名顺序分配进扇形，每 6 个一组。
         超过 6 个文件自动分组成多张图（旧版会静默丢弃）。
+        预测图永远使用固定渲染参数（实例参数，由 Predictor 从 checkpoint 恢复），
+        不做域随机化。
 
         返回：[(image_path, metadata), ...]
         """
@@ -238,6 +285,8 @@ class SDPRenderer:
             logger.warning('模式B：%s 中没有 .npy 文件', data_folder)
             return []
 
+        fixed_params = {'segment_length': self.segment_length,
+                        'tau': self.tau, 'jitter': self.jitter}
         results = []
         n_groups = (len(npy_files) + 5) // 6
         for g in range(n_groups):
@@ -247,7 +296,8 @@ class SDPRenderer:
                 if sector_idx < len(group):
                     data_file = os.path.join(data_folder, group[sector_idx])
                     theta, r = self.signal_to_petal(load_npy(data_file),
-                                                    SECTOR_ANGLES[sector_idx])
+                                                    SECTOR_ANGLES[sector_idx],
+                                                    fixed_params)
                     has_data = theta is not None
                 else:
                     data_file, theta, r, has_data = None, None, None, False
@@ -256,6 +306,7 @@ class SDPRenderer:
                     'position': sector_idx, 'data_file': data_file,
                     'true_label': None, 'has_data': has_data,
                     'angle_range': list(SECTOR_ANGLES[sector_idx]),
+                    'render_params': fixed_params,
                 })
 
             out_path = os.path.join(output_dir, f'predict_{g:03d}.png')
@@ -273,16 +324,18 @@ class SDPRenderer:
 
     # ------------------------------------------------------------ 快速路径：单花瓣
     def render_single_petal(self, data, output_path=None,
-                            canvas_size=DEFAULT_IMAGE_SIZE):
+                            canvas_size=DEFAULT_IMAGE_SIZE, params=None):
         """
         快速路径：把一条信号直接渲染为"已摆正"的单花瓣 RGBA 图像。
         使用规范扇形 (60°,120°)（中心 90°，正上方），绘制圆心锚点（与六合一图
         保持一致，作为花瓣尖端的定位基准），再按统一几何规范裁剪缩放，
         输出与拆分器完全一致。
+        randomize=True 时随机采样渲染参数（训练用域随机化）。
 
         返回：(petal_rgba 或 None, output_path 或 None)
         """
-        theta, r = self.signal_to_petal(data, (60, 120))
+        p = params or self._sample_params()
+        theta, r = self.signal_to_petal(data, (60, 120), p)
         if theta is None:
             return None, None
 
@@ -342,5 +395,6 @@ class SDPRenderer:
                                 f'{cls}: {count}/{len(files)}')
             stats[cls] = count
 
-        logger.info('快速路径完成：%s -> %s', stats, output_dir)
+        logger.info('快速路径完成：%s -> %s（域随机化=%s）',
+                    stats, output_dir, self.randomize)
         return stats
