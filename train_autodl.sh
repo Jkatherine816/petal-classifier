@@ -14,8 +14,8 @@ BATCH=${3:-128}
 echo "==> 1/3 生成时序信号（每类 ${COUNT} 条）"
 python cli.py generate --output data/raw --count "${COUNT}" --seed 42
 
-echo "==> 2/3 快速路径渲染单花瓣（域随机化默认开启，防参数指纹）"
-python cli.py split --fast --input data/raw --output data/petals
+echo "==> 2/3 快速路径渲染单花瓣（域随机化默认开启，7 进程并行）"
+python cli.py split --fast --input data/raw --output data/petals --render_workers 7
 
 echo "==> 3/3 训练（Enhanced DenseNet + CBAM，输入 96，标签平滑 0.1）"
 python cli.py train --data data/petals --output models/run --model enhanced \

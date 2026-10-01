@@ -40,8 +40,14 @@ def cmd_render(args):
 def cmd_split(args):
     if args.fast:
         from core.sdp_renderer import SDPRenderer
-        SDPRenderer(randomize=args.randomize).render_single_petals(
-            args.input, args.output)
+
+        def _progress(pct, msg):
+            print(f'[渲染进度] {pct:3d}%  {msg}', flush=True)
+
+        stats = SDPRenderer(randomize=args.randomize).render_single_petals(
+            args.input, args.output, progress_cb=_progress,
+            workers=args.render_workers)
+        print(f'快速路径完成: {stats}')
     else:
         from core.petal_splitter import PetalSplitter
         PetalSplitter().batch_split(args.input, args.output,
@@ -166,6 +172,9 @@ def main():
     p.add_argument('--grayscale', action='store_true', help='输出转灰度')
     p.add_argument('--no-randomize', dest='randomize', action='store_false',
                    help='快速路径关闭域随机化（默认开启）')
+    p.add_argument('--render_workers', type=int, default=1,
+                   help='快速路径渲染进程数（按类别并行，>1 时最多 7，'
+                        'CPU 服务器建议 7）')
     p.set_defaults(func=cmd_split, randomize=True)
 
     p = sub.add_parser('train', help='训练模型')

@@ -14,6 +14,7 @@ core/sdp_renderer.py - SDP 六合一图像渲染器
     - 域随机化（randomize=True，训练推荐）：逐花瓣随机采样
       segment_length / tau / jitter，防止模型记忆"参数指纹"（点密度/纹理），
       被迫学习对参数不变的形状特征。采样值写入元数据 render_params 可追溯。
+    - 快速路径支持多进程并行（workers>1，按类别分派，最多 7 进程）。
 """
 
 import os
@@ -37,6 +38,21 @@ from .signal_generator import load_npy, load_dataset_index
 from .image_utils import crop_and_square
 
 logger = logging.getLogger(__name__)
+
+
+def _render_class_task(task):
+    """多进程任务：渲染一个类别的全部单花瓣（每个进程独立 renderer 实例）。"""
+    (cls, files, class_dir, randomize, image_size, dpi, seed) = task
+    renderer = SDPRenderer(image_size=image_size, dpi=dpi,
+                           randomize=randomize, seed=seed)
+    count = 0
+    for fpath in files:
+        stem = os.path.splitext(os.path.basename(fpath))[0]
+        out_path = os.path.join(class_dir, f'{stem}_petal.png')
+        petal, _ = renderer.render_single_petal(load_npy(fpath), out_path)
+        if petal is not None:
+            count += 1
+    return cls, count
 
 
 class SDPRenderer:
@@ -365,15 +381,22 @@ class SDPRenderer:
             Image.fromarray(petal, 'RGBA').save(output_path)
         return petal, output_path
 
-    def render_single_petals(self, data_root, output_dir, progress_cb=None):
+    def render_single_petals(self, data_root, output_dir, progress_cb=None,
+                             workers=1):
         """
         快速路径批量版：数据目录 -> 按类别组织的单花瓣图像目录。
         目录结构与拆分器输出一致（class_<类别>/*.png），可直接用于训练。
+        workers>1 时按类别多进程并行（7 类最多 7 进程，CPU 服务器推荐）。
 
         返回：{类别: 生成数量}
         """
         os.makedirs(output_dir, exist_ok=True)
         data_index = load_dataset_index(data_root)
+
+        if workers and workers > 1:
+            return self._render_parallel(data_index, output_dir,
+                                         progress_cb, workers)
+
         total = sum(len(v) for v in data_index.values())
         done = 0
         stats = {}
@@ -395,6 +418,32 @@ class SDPRenderer:
                                 f'{cls}: {count}/{len(files)}')
             stats[cls] = count
 
+        logger.info('快速路径完成：%s -> %s（域随机化=%s）',
+                    stats, output_dir, self.randomize)
+        return stats
+
+    def _render_parallel(self, data_index, output_dir, progress_cb, workers):
+        """按类别分派多进程渲染（每类一个任务，最多 7 并行）。"""
+        import multiprocessing as mp
+        tasks = []
+        for i, cls in enumerate(CLASSES):
+            files = data_index.get(cls, [])
+            class_dir = os.path.join(output_dir, f'{CLASS_DIR_PREFIX}{cls}')
+            os.makedirs(class_dir, exist_ok=True)
+            tasks.append((cls, files, class_dir, self.randomize,
+                          self.image_size, self.dpi, 1000 + i))
+
+        stats = {}
+        done = 0
+        n_procs = min(workers, len(tasks))
+        logger.info('快速路径并行渲染：%d 个进程', n_procs)
+        with mp.Pool(processes=n_procs) as pool:
+            for cls, count in pool.imap_unordered(_render_class_task, tasks):
+                stats[cls] = count
+                done += 1
+                if progress_cb:
+                    progress_cb(int(done / len(tasks) * 100),
+                                f'{cls} 完成 ({count} 张)')
         logger.info('快速路径完成：%s -> %s（域随机化=%s）',
                     stats, output_dir, self.randomize)
         return stats
