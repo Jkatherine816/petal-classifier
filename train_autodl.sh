@@ -11,8 +11,12 @@ COUNT=${1:-2000}    # 每类样本数（7 类，2000 -> 共 14000 条信号/花�
 EPOCHS=${2:-100}
 BATCH=${3:-128}
 
-echo "==> 1/3 生成时序信号（每类 ${COUNT} 条）"
-python cli.py generate --output data/raw --count "${COUNT}" --seed 42
+if [ -d data/raw ] && [ "$(find data/raw -name '*.npy' 2>/dev/null | wc -l)" -gt 0 ]; then
+    echo "==> 1/3 检测到 data/raw 已有数据，跳过生成（删除该目录可重新生成）"
+else
+    echo "==> 1/3 生成时序信号（每类 ${COUNT} 条）"
+    python cli.py generate --output data/raw --count "${COUNT}" --seed 42
+fi
 
 echo "==> 2/3 快速路径渲染单花瓣（域随机化默认开启，7 进程并行）"
 python cli.py split --fast --input data/raw --output data/petals --render_workers 7
