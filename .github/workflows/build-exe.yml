@@ -31,7 +31,7 @@ jobs:
           pytest tests/ -q
 
       - name: Build EXE with PyInstaller
-        run: pyinstaller --noconfirm --clean --windowed --name "SDP_PetalClassifier" --collect-all torch --collect-all torchvision main.py
+        run: pyinstaller --noconfirm --clean --windowed --name "SDP_PetalClassifier" --collect-all torch --collect-all torchvision --collect-all sklearn main.py
 
       - name: Smoke check output
         run: |
