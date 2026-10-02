@@ -87,8 +87,10 @@ def build_train_transform(input_size=DEFAULT_INPUT_SIZE, aug_level='medium',
     """
     训练变换：先 PIL 增强，再 ToTensor + Normalize，最后张量级增强。
 
-    RandomErasing 随机擦除一块区域，专门模拟渲染参数变化导致的
-    点密度漂移（配合渲染端域随机化，防"参数指纹"捷径学习）。
+    注意：花瓣是稀疏点阵图（不是密集自然图像），增强必须克制——
+    过强的 RandomErasing 会把有效点整块抹掉，过强的 RandomResizedCrop
+    会切掉花瓣尖端的圆心锚点，二者都会破坏标签信息导致欠拟合。
+    点密度漂移已由渲染端域随机化覆盖，此处 RandomErasing 仅保留小比例。
     """
     aug_level = (aug_level or 'none').lower()
     pil_ops = []
@@ -96,29 +98,28 @@ def build_train_transform(input_size=DEFAULT_INPUT_SIZE, aug_level='medium',
     if aug_level == 'light':
         pil_ops = [
             T.RandomHorizontalFlip(p=0.3),
-            T.RandomRotation(15),
-            T.ColorJitter(brightness=0.15, contrast=0.15),
+            T.RandomRotation(10),
+            T.ColorJitter(brightness=0.1, contrast=0.1),
         ]
-        tensor_ops = [T.RandomErasing(p=0.15, scale=(0.02, 0.12))]
+        tensor_ops = []
     elif aug_level == 'medium':
         pil_ops = [
             T.RandomHorizontalFlip(p=0.5),
-            T.RandomVerticalFlip(p=0.2),
             T.RandomRotation(15),
-            T.ColorJitter(brightness=0.25, contrast=0.25),
-            T.RandomResizedCrop(input_size, scale=(0.6, 1.0)),
+            T.ColorJitter(brightness=0.2, contrast=0.2),
+            T.RandomResizedCrop(input_size, scale=(0.85, 1.0)),
         ]
-        tensor_ops = [T.RandomErasing(p=0.3, scale=(0.02, 0.2))]
+        tensor_ops = [T.RandomErasing(p=0.1, scale=(0.02, 0.06))]
     elif aug_level == 'heavy':
         pil_ops = [
             T.RandomHorizontalFlip(p=0.5),
-            T.RandomVerticalFlip(p=0.3),
-            T.RandomRotation(25),
-            T.ColorJitter(brightness=0.35, contrast=0.35, saturation=0.2),
-            T.RandomResizedCrop(input_size, scale=(0.5, 1.0)),
-            T.RandomApply([T.GaussianBlur(3)], p=0.25),
+            T.RandomVerticalFlip(p=0.2),
+            T.RandomRotation(20),
+            T.ColorJitter(brightness=0.3, contrast=0.3),
+            T.RandomResizedCrop(input_size, scale=(0.75, 1.0)),
+            T.RandomApply([T.GaussianBlur(3)], p=0.2),
         ]
-        tensor_ops = [T.RandomErasing(p=0.4, scale=(0.02, 0.25))]
+        tensor_ops = [T.RandomErasing(p=0.2, scale=(0.02, 0.12))]
     return T.Compose(pil_ops + [
         T.Resize((input_size, input_size)),
         T.ToTensor(),
